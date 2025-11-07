@@ -1,0 +1,393 @@
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: 'VG-TP05'   # MONGODB_URI (secret)
+
+  - name: nodeVersion
+    value: '20.x'
+  - name: azureSubscription
+    value: 'azure-tp05-connection'
+  - name: resourceGroup
+    value: 'rg-tp05-ingsoft3-2025'
+
+  # NOMBRES EXACTOS DE LAS WEB APPS (sin sufijos de Azure)
+  - name: webappBackQA
+    value: 'AppTP5-BackendQA'
+  - name: webappFrontQA
+    value: 'AppTP05-FrontendQA'
+  - name: webappBackPRD
+    value: 'AppTP05-BackendPROD'
+  - name: webappFrontPRD
+    value: 'AppTP05-FrontendPROD'
+
+  - name: healthPath
+    value: '/healthz'
+
+stages:
+# ============== TESTS ==============
+- stage: Tests
+  displayName: 'Ejecutar Tests Unitarios'
+  jobs:
+  - job: TestBackend
+    displayName: 'Backend Tests'
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '$(nodeVersion)'
+
+    - script: |
+        set -e
+        BACK_PKG=$(find "$(Build.SourcesDirectory)" -type f -path "*/backend/package.json" -print -quit || true)
+        [ -z "$BACK_PKG" ] && { echo "❌ No se encontró backend/package.json"; exit 1; }
+        BACKEND_DIR=$(dirname "$BACK_PKG")
+        echo "✅ Backend detectado: $BACKEND_DIR"
+        echo "##vso[task.setvariable variable=BACKEND_DIR]$BACKEND_DIR"
+      displayName: 'Detectar backend'
+
+    - script: |
+        cd "$(BACKEND_DIR)"
+        npm ci
+        npm test
+      displayName: 'Backend: npm test'
+
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '$(BACKEND_DIR)/coverage/junit.xml'
+        failTaskOnFailedTests: true
+      condition: always()
+
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(BACKEND_DIR)/coverage/cobertura-coverage.xml'
+      condition: always()
+
+  - job: TestFrontend
+    displayName: 'Frontend Tests'
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '$(nodeVersion)'
+
+    - script: |
+        set -e
+        FRONT_PKG=$(find "$(Build.SourcesDirectory)" -type f -path "*/frontend/package.json" -print -quit || true)
+        [ -z "$FRONT_PKG" ] && { echo "❌ No se encontró frontend/package.json"; exit 1; }
+        FRONTEND_DIR=$(dirname "$FRONT_PKG")
+        echo "✅ Frontend detectado: $FRONTEND_DIR"
+        echo "##vso[task.setvariable variable=FRONTEND_DIR]$FRONTEND_DIR"
+      displayName: 'Detectar frontend'
+
+    - script: |
+        cd "$(FRONTEND_DIR)"
+        npm ci
+        npm test
+      displayName: 'Frontend: npm test'
+
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '$(FRONTEND_DIR)/coverage/junit.xml'
+        failTaskOnFailedTests: true
+      condition: always()
+
+# ============== BUILD ==============
+- stage: Build
+  displayName: 'Build + Empaquetar backend y frontend (Node 20)'
+  dependsOn: Tests
+  condition: succeeded()
+  jobs:
+  - job: BuildAll
+    steps:
+    - checkout: self
+
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '$(nodeVersion)'
+
+    # Detectar rutas automáticamente
+    - script: |
+        set -e
+        echo "Sources: $(Build.SourcesDirectory)"
+        BACK_PKG=$(find "$(Build.SourcesDirectory)" -type f -path "*/backend/package.json" -print -quit || true)
+        FRONT_PKG=$(find "$(Build.SourcesDirectory)" -type f -path "*/frontend/package.json" -print -quit || true)
+        [ -z "$BACK_PKG" ] && { echo "❌ No se encontró backend/package.json"; exit 1; }
+        [ -z "$FRONT_PKG" ] && { echo "❌ No se encontró frontend/package.json"; exit 1; }
+        
+        BACKEND_DIR=$(dirname "$BACK_PKG")
+        FRONTEND_DIR=$(dirname "$FRONT_PKG")
+        
+        echo "✅ Backend detectado: $BACKEND_DIR"
+        echo "✅ Frontend detectado: $FRONTEND_DIR"
+        
+        echo "##vso[task.setvariable variable=BACKEND_DIR]$BACKEND_DIR"
+        echo "##vso[task.setvariable variable=FRONTEND_DIR]$FRONTEND_DIR"
+      displayName: 'Detectar rutas backend/frontend'
+
+    # Validar que el backend sea Node.js
+    - script: |
+        set -e
+        cd "$(BACKEND_DIR)"
+        
+        # Verificar que NO haya archivos .go
+        if ls *.go 1> /dev/null 2>&1; then
+          echo "❌ ERROR: Se encontraron archivos .go en backend/"
+          echo "Este pipeline está configurado para Node.js. Elimina los archivos .go"
+          ls -la *.go
+          exit 1
+        fi
+        
+        # Verificar que exista server.js
+        if [ ! -f "server.js" ]; then
+          echo "❌ ERROR: No se encontró server.js en backend/"
+          exit 1
+        fi
+        
+        # Verificar que package.json tenga el script start
+        if ! grep -q '"start"' package.json; then
+          echo "❌ ERROR: package.json no tiene script 'start'"
+          exit 1
+        fi
+        
+        echo "✅ Backend Node.js validado correctamente"
+      displayName: 'Validar backend Node.js'
+
+    # Backend: instalar deps y zip
+    - script: |
+        set -e
+        cd "$(BACKEND_DIR)"
+        
+        echo "📦 Instalando dependencias de producción..."
+        npm ci --omit=dev
+        
+        echo "📋 Archivos en backend antes del ZIP:"
+        ls -lah
+        
+        # Crear el ZIP
+        mkdir -p "$(Build.ArtifactStagingDirectory)"
+        BACK_ZIP="$(Build.ArtifactStagingDirectory)/backend.zip"
+        
+        # Zip excluyendo .git, .env, y archivos innecesarios
+        zip -r "$BACK_ZIP" . \
+          -x "*.git*" \
+          -x "*.env*" \
+          -x "*.log" \
+          -x "*.go" \
+          -x "go.mod" \
+          -x "go.sum"
+        
+        echo "✅ Backend ZIP creado: $BACK_ZIP"
+        zipinfo -1 "$BACK_ZIP" | head -20
+      displayName: 'Backend: npm ci y empaquetar ZIP'
+
+    # Frontend: instalar deps y zip
+    - script: |
+        set -e
+        cd "$(FRONTEND_DIR)"
+        
+        echo "📦 Instalando dependencias del frontend..."
+        [ -f package.json ] && npm ci --omit=dev || echo "⚠️  No hay package.json en frontend"
+        
+        mkdir -p "$(Build.ArtifactStagingDirectory)"
+        FRONT_ZIP="$(Build.ArtifactStagingDirectory)/frontend.zip"
+        
+        zip -r "$FRONT_ZIP" . \
+          -x "*.git*" \
+          -x "*.env*" \
+          -x "*.log"
+        
+        echo "✅ Frontend ZIP creado: $FRONT_ZIP"
+      displayName: 'Frontend: npm ci y empaquetar ZIP'
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)'
+        artifactName: 'drop'
+        publishLocation: 'Container'
+
+# ============ DEPLOY QA ============
+- stage: DeployQA
+  displayName: 'Deploy QA (Back + Front)'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: QA
+    environment: 'QA'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          # Obtener URLs reales de Azure
+          - task: AzureCLI@2
+            displayName: 'Obtener URLs reales de QA'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "🔍 Obteniendo URLs reales..."
+                
+                FRONT_QA_URL=$(az webapp show -g "$(resourceGroup)" -n "$(webappFrontQA)" --query defaultHostName -o tsv)
+                BACK_QA_URL=$(az webapp show -g "$(resourceGroup)" -n "$(webappBackQA)" --query defaultHostName -o tsv)
+                
+                echo "Frontend QA: https://$FRONT_QA_URL"
+                echo "Backend QA: https://$BACK_QA_URL"
+                
+                echo "##vso[task.setvariable variable=frontQAUrl]https://$FRONT_QA_URL"
+                echo "##vso[task.setvariable variable=backQAUrl]https://$BACK_QA_URL"
+
+          # Backend QA - App Settings
+          - task: AzureCLI@2
+            displayName: 'Backend QA - App Settings'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "⚙️  Configurando App Settings para Backend QA..."
+                echo "ALLOWED_ORIGINS: $(frontQAUrl),http://localhost:3000,http://localhost:5500"
+                
+                az webapp config appsettings set -g "$(resourceGroup)" -n "$(webappBackQA)" --settings \
+                  MONGODB_URI="$(MONGODB_URI)" \
+                  DB_NAME="crudbasico_qa" \
+                  ALLOWED_ORIGINS="$(frontQAUrl),http://localhost:3000,http://localhost:5500" \
+                  WEBSITE_HEALTHCHECK_PATH="$(healthPath)" \
+                  WEBSITE_NODE_DEFAULT_VERSION="~20" \
+                  PORT="8080" \
+                  WEBSITES_PORT="8080" \
+                  WEBSITE_RUN_FROM_PACKAGE="1" \
+                  SCM_DO_BUILD_DURING_DEPLOYMENT="false"
+                echo "✅ App Settings configurados"
+
+          # Backend QA - Deploy ZIP
+          - task: AzureWebApp@1
+            displayName: 'Deploy Backend QA (ZIP)'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              appType: 'webAppLinux'
+              appName: '$(webappBackQA)'
+              package: '$(Pipeline.Workspace)/drop/backend.zip'
+              runtimeStack: 'NODE|20-lts'
+              startUpCommand: 'npm start'
+
+          # Frontend QA - App Settings
+          - task: AzureCLI@2
+            displayName: 'Frontend QA - App Settings'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "⚙️  Configurando App Settings para Frontend QA..."
+                az webapp config appsettings set -g "$(resourceGroup)" -n "$(webappFrontQA)" --settings \
+                  API_BASE_URL="$(backQAUrl)" \
+                  WEBSITE_NODE_DEFAULT_VERSION="~20" \
+                  WEBSITE_RUN_FROM_PACKAGE="1" \
+                  SCM_DO_BUILD_DURING_DEPLOYMENT="false"
+                echo "✅ App Settings configurados"
+
+          # Frontend QA - Deploy ZIP
+          - task: AzureWebApp@1
+            displayName: 'Deploy Frontend QA (ZIP)'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              appType: 'webAppLinux'
+              appName: '$(webappFrontQA)'
+              package: '$(Pipeline.Workspace)/drop/frontend.zip'
+              runtimeStack: 'NODE|20-lts'
+
+# =========== DEPLOY PROD ===========
+- stage: DeployPROD
+  displayName: 'Deploy PROD (aprobación)'
+  dependsOn: DeployQA
+  condition: succeeded()
+  jobs:
+  - deployment: PROD
+    environment: 'PROD'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          # Obtener URLs reales de PROD
+          - task: AzureCLI@2
+            displayName: 'Obtener URLs reales de PROD'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "🔍 Obteniendo URLs reales..."
+                
+                FRONT_PRD_URL=$(az webapp show -g "$(resourceGroup)" -n "$(webappFrontPRD)" --query defaultHostName -o tsv)
+                BACK_PRD_URL=$(az webapp show -g "$(resourceGroup)" -n "$(webappBackPRD)" --query defaultHostName -o tsv)
+                
+                echo "Frontend PROD: https://$FRONT_PRD_URL"
+                echo "Backend PROD: https://$BACK_PRD_URL"
+                
+                echo "##vso[task.setvariable variable=frontPRDUrl]https://$FRONT_PRD_URL"
+                echo "##vso[task.setvariable variable=backPRDUrl]https://$BACK_PRD_URL"
+
+          # Backend PROD - App Settings
+          - task: AzureCLI@2
+            displayName: 'Backend PROD - App Settings'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "⚙️  Configurando App Settings para Backend PROD..."
+                echo "ALLOWED_ORIGINS: $(frontPRDUrl)"
+                
+                az webapp config appsettings set -g "$(resourceGroup)" -n "$(webappBackPRD)" --settings \
+                  MONGODB_URI="$(MONGODB_URI)" \
+                  DB_NAME="crudbasico_prod" \
+                  ALLOWED_ORIGINS="$(frontPRDUrl)" \
+                  WEBSITE_HEALTHCHECK_PATH="$(healthPath)" \
+                  WEBSITE_NODE_DEFAULT_VERSION="~20" \
+                  PORT="8080" \
+                  WEBSITES_PORT="8080" \
+                  WEBSITE_RUN_FROM_PACKAGE="1" \
+                  SCM_DO_BUILD_DURING_DEPLOYMENT="false"
+                echo "✅ App Settings configurados"
+
+          # Backend PROD - Deploy ZIP
+          - task: AzureWebApp@1
+            displayName: 'Deploy Backend PROD (ZIP)'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              appType: 'webAppLinux'
+              appName: '$(webappBackPRD)'
+              package: '$(Pipeline.Workspace)/drop/backend.zip'
+              runtimeStack: 'NODE|20-lts'
+              startUpCommand: 'npm start'
+
+          # Frontend PROD - App Settings
+          - task: AzureCLI@2
+            displayName: 'Frontend PROD - App Settings'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "⚙️  Configurando App Settings para Frontend PROD..."
+                az webapp config appsettings set -g "$(resourceGroup)" -n "$(webappFrontPRD)" --settings \
+                  API_BASE_URL="$(backPRDUrl)" \
+                  WEBSITE_NODE_DEFAULT_VERSION="~20" \
+                  WEBSITE_RUN_FROM_PACKAGE="1" \
+                  SCM_DO_BUILD_DURING_DEPLOYMENT="false"
+                echo "✅ App Settings configurados"
+
+          # Frontend PROD - Deploy ZIP
+          - task: AzureWebApp@1
+            displayName: 'Deploy Frontend PROD (ZIP)'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              appType: 'webAppLinux'
+              appName: '$(webappFrontPRD)'
+              package: '$(Pipeline.Workspace)/drop/frontend.zip'
+              runtimeStack: 'NODE|20-lts'
